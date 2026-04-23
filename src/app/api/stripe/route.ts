@@ -1,87 +1,48 @@
-import Stripe from 'stripe'
+import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: '2024-06-20',
-})
+export async function POST(req: NextRequest) {
+  const stripe = (await import('stripe')).default
+  const stripeClient = new stripe(process.env.STRIPE_SECRET_KEY!, {
+    apiVersion: '2024-06-20' as any,
+  })
 
-function createAdminClient() {
-  return createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!
-  )
-}
+  const body = await req.text()
+  const sig = req.headers.get('stripe-signature')!
 
-export async function POST(request: Request) {
-  const body = await request.text()
-  const signature = request.headers.get('stripe-signature')
-
-  if (!signature) {
-    return Response.json({ error: '서명이 없습니다.' }, { status: 400 })
-  }
-
-  let event: Stripe.Event
-
+  let event
   try {
-    event = stripe.webhooks.constructEvent(
+    event = stripeClient.webhooks.constructEvent(
       body,
-      signature,
+      sig,
       process.env.STRIPE_WEBHOOK_SECRET!
     )
   } catch (err) {
-    console.error('[Stripe Webhook] 서명 검증 실패:', err)
-    return Response.json({ error: '웹훅 서명 검증 실패' }, { status: 400 })
+    return NextResponse.json({ error: 'Webhook error' }, { status: 400 })
   }
 
   if (event.type === 'checkout.session.completed') {
-    const session = event.data.object as Stripe.Checkout.Session
+    const session = event.data.object as any
+    const email = session.customer_details?.email
 
-    const customerEmail = session.customer_details?.email
-    if (!customerEmail) {
-      console.error('[Stripe Webhook] 이메일 없음')
-      return Response.json({ error: '이메일 없음' }, { status: 400 })
-    }
+    const supabase = createClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!
+    )
 
-    const admin = createAdminClient()
-
-    // 이메일로 유저 조회
-    const { data: users, error: userError } = await admin.auth.admin.listUsers()
-    if (userError) {
-      console.error('[Stripe Webhook] 유저 조회 실패:', userError)
-      return Response.json({ error: '유저 조회 실패' }, { status: 500 })
-    }
-
-    const user = users.users.find((u) => u.email === customerEmail)
-    if (!user) {
-      console.error('[Stripe Webhook] 유저를 찾을 수 없음:', customerEmail)
-      return Response.json({ error: '유저를 찾을 수 없음' }, { status: 404 })
-    }
-
-    // 현재 크레딧 조회
-    const { data: profile, error: profileError } = await admin
+    const { data: user } = await supabase
       .from('profiles')
-      .select('credits')
-      .eq('id', user.id)
+      .select('id')
+      .eq('email', email)
       .single()
 
-    if (profileError) {
-      console.error('[Stripe Webhook] 프로필 조회 실패:', profileError)
-      return Response.json({ error: '프로필 조회 실패' }, { status: 500 })
+    if (user) {
+      await supabase.rpc('increment_credits', {
+        user_id: user.id,
+        amount: 100
+      })
     }
-
-    // 크레딧 100 추가
-    const { error: updateError } = await admin
-      .from('profiles')
-      .update({ credits: profile.credits + 100 })
-      .eq('id', user.id)
-
-    if (updateError) {
-      console.error('[Stripe Webhook] 크레딧 업데이트 실패:', updateError)
-      return Response.json({ error: '크레딧 업데이트 실패' }, { status: 500 })
-    }
-
-    console.log(`[Stripe Webhook] ${customerEmail} 크레딧 +100 완료 (잔액: ${profile.credits + 100})`)
   }
 
-  return Response.json({ received: true })
+  return NextResponse.json({ received: true })
 }
